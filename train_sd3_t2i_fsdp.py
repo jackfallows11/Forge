@@ -14,6 +14,7 @@ from forge.parallel import FSDPStrategy
 from forge.trainer import Trainer
 from forge.training_args import TrainingEngineArgs
 
+import bitsandbytes as bnb
 
 class SyntheticTextImageDataset(Dataset):
     def __init__(self, length: int = 16, image_size: int = 256) -> None:
@@ -44,7 +45,7 @@ def collate_fn(items: list[dict[str, Any]]) -> dict[str, Any]:
 
 def build_optimizer(model: torch.nn.Module, args: TrainingEngineArgs) -> torch.optim.Optimizer:
     params = [param for param in model.parameters() if param.requires_grad]
-    return torch.optim.AdamW(
+    return bnb.optim.AdamW8bit(
         params,
         lr=args.learning_rate,
         weight_decay=args.weight_decay,

@@ -40,7 +40,7 @@ class DiffusersSD3Adapter(ModelAdapter):
         )
         pipe.scheduler.set_timesteps(pipe.scheduler.config.num_train_timesteps)
         self.pipeline = pipe
-        #register all submodules needed, including trainable and non-trainable ones
+
         self.runtime_modules = {
             "dit": pipe.transformer,
             "vae": pipe.vae,
@@ -53,25 +53,19 @@ class DiffusersSD3Adapter(ModelAdapter):
             "tokenizer_3": pipe.tokenizer_3,
         }
 
-        #you would need to unfreeze more modules for a real training run
         self.trainable_modules = ["dit"]
         self.primary_train_model = self.runtime_modules["dit"]
 
-        self.runtime_modules["vae"].requires_grad_(False)
-        self.runtime_modules["text_encoder"].requires_grad_(False)
+        # Freeze non-trainable modules and keep on CPU to save GPU memory
+        self.runtime_modules["vae"].requires_grad_(False).to("cpu")
+        self.runtime_modules["text_encoder"].requires_grad_(False).to("cpu")
         if self.runtime_modules["text_encoder_2"] is not None:
-            self.runtime_modules["text_encoder_2"].requires_grad_(False)
+            self.runtime_modules["text_encoder_2"].requires_grad_(False).to("cpu")
         if self.runtime_modules["text_encoder_3"] is not None:
-            self.runtime_modules["text_encoder_3"].requires_grad_(False)
-
-        device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0"))) \
-            if torch.cuda.is_available() else torch.device("cpu")
-        self.runtime_modules["vae"].to(device)
-        self.runtime_modules["text_encoder"].to(device)
-        if self.runtime_modules["text_encoder_2"] is not None:
-            self.runtime_modules["text_encoder_2"].to(device)
-        if self.runtime_modules["text_encoder_3"] is not None:
-            self.runtime_modules["text_encoder_3"].to(device)
+            self.runtime_modules["text_encoder_3"].requires_grad_(False).to("cpu")
+        
+        if hasattr(self.primary_train_model, "enable_gradient_checkpointing"):
+            self.primary_train_model.enable_gradient_checkpointing()
 
         return {
             "model": self.primary_train_model,
@@ -90,29 +84,34 @@ class DiffusersSD3Adapter(ModelAdapter):
             self.pipeline.transformer = model
 
     def forward_loss(self, batch_state: BatchState) -> dict[str, Any]:
-        if self.train_model is None and self.primary_train_model is None:
-            raise RuntimeError("build_modules must be called before forward_loss")
         pixel_values = batch_state.raw_batch["pixel_values"]
         prompts = batch_state.raw_batch["prompts"]
-        model = self.train_model if self.train_model is not None else self.primary_train_model
 
-        device = pixel_values.device
+        if self.train_model is not None:
+            model = self.train_model
+        elif self.primary_train_model is not None:
+            model = self.primary_train_model
+        else:
+            raise RuntimeError("build_modules must be called before forward_loss")
+
+        device = next(model.parameters()).device
         dtype = next(model.parameters()).dtype
+        print(f"DEBUG: model device={device}, dtype={dtype}")
+
         scheduler = self.runtime_modules["noise_scheduler"]
-        latents = self._encode_latents(pixel_values, device)
-        prompt_embeds, pooled_prompt_embeds = self._encode_prompts(prompts, device)
-        latents = latents.to(dtype=dtype)
+
+        latents = self._encode_latents(pixel_values)
+        prompt_embeds, pooled_prompt_embeds = self._encode_prompts(prompts)
+
+        latents = latents.to(device=device, dtype=dtype)
         prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
         pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=dtype)
 
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
         timesteps = torch.randint(
-            0,
-            scheduler.config.num_train_timesteps,
-            (bsz,),
-            device=device,
-            dtype=torch.long,
+            0, scheduler.config.num_train_timesteps,
+            (bsz,), device=device, dtype=torch.long,
         )
         sigmas = self._sigmas_for_timesteps(timesteps, device=device, dtype=latents.dtype)
         sigmas = sigmas.view(bsz, *([1] * (latents.ndim - 1)))
@@ -127,6 +126,7 @@ class DiffusersSD3Adapter(ModelAdapter):
             pooled_projections=pooled_prompt_embeds,
             return_dict=False,
         )[0]
+
         loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
         batch_state.loss_dict["loss"] = loss
         batch_state.metrics["loss"] = float(loss.detach().item())
@@ -167,27 +167,45 @@ class DiffusersSD3Adapter(ModelAdapter):
             transformer.train()
         return {"sample_paths": images}
 
-    def _encode_latents(self, pixel_values: torch.Tensor, device: torch.device) -> torch.Tensor:
+    def _encode_latents(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Encode pixel values to latents on CPU."""
         vae = self.runtime_modules["vae"]
-        pixel_values = pixel_values.to(device=device, dtype=vae.dtype)
+        pixel_values = pixel_values.to(device="cpu", dtype=vae.dtype)
         with torch.no_grad():
             latents = vae.encode(pixel_values).latent_dist.sample()
             latents = (latents - vae.config.shift_factor) * vae.config.scaling_factor
-        return latents
+        return latents  # on CPU, caller moves to GPU
 
-    def _encode_prompts(self, prompts: list[str], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    def _encode_prompts(self, prompts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Encode prompts using all three text encoders on CPU.
+
+        SD3 expects:
+          - encoder_hidden_states: (B, seq_len, 4096)
+            = T5 hidden states only (4096-dim), since context_embedder projects from 4096.
+            CLIP hidden states are concatenated along the sequence dimension first,
+            then T5 hidden states are appended — but ALL must have hidden_dim=4096.
+            The standard diffusers approach is to zero-pad CLIP to 4096 on the hidden dim,
+            then concat all three on seq dim.
+          - pooled_projections: (B, 2048)
+            = CLIP-L pooled (768) + CLIP-G pooled (1280) concatenated on hidden dim.
+            T5 does NOT contribute a pooled embedding.
+        """
         encoders = [
-            (self.runtime_modules["tokenizer"], self.runtime_modules["text_encoder"]),
-            (self.runtime_modules["tokenizer_2"], self.runtime_modules["text_encoder_2"]),
-            (self.runtime_modules["tokenizer_3"], self.runtime_modules["text_encoder_3"]),
+            (self.runtime_modules["tokenizer"],   self.runtime_modules["text_encoder"]),    # CLIP-L: hidden 768,  seq 77
+            (self.runtime_modules["tokenizer_2"], self.runtime_modules["text_encoder_2"]),  # CLIP-G: hidden 1280, seq 77
+            (self.runtime_modules["tokenizer_3"], self.runtime_modules["text_encoder_3"]),  # T5:     hidden 4096, seq 512
         ]
-        prompt_embeds_list: list[torch.Tensor] = []
+
+        clip_hidden_states: list[torch.Tensor] = []
+        t5_hidden_states: torch.Tensor | None = None
         pooled_embeds_list: list[torch.Tensor] = []
 
         with torch.no_grad():
-            for tokenizer, encoder in encoders:
+            for i, (tokenizer, encoder) in enumerate(encoders):
                 if tokenizer is None or encoder is None:
                     continue
+
                 text_inputs = tokenizer(
                     prompts,
                     padding="max_length",
@@ -195,22 +213,53 @@ class DiffusersSD3Adapter(ModelAdapter):
                     truncation=True,
                     return_tensors="pt",
                 )
-                input_ids = text_inputs.input_ids.to(device)
+                input_ids = text_inputs.input_ids.to("cpu")
                 outputs = encoder(input_ids, output_hidden_states=True)
-                hidden_states = outputs.hidden_states[-2]
-                pooled = outputs[0]
-                prompt_embeds_list.append(hidden_states)
-                pooled_embeds_list.append(pooled)
+                hidden = outputs.hidden_states[-2]  # (B, seq_len, hidden_dim)
 
-        prompt_embeds = torch.cat(prompt_embeds_list, dim=-1)
+                if i < 2:
+                    # CLIP encoders — collect pooled, pad hidden dim to 4096
+                    pooled = outputs[0]
+                    if pooled.dim() == 3:
+                        pooled = pooled[:, 0, :]  # (B, hidden_dim)
+                    pooled_embeds_list.append(pooled)
+
+                    # Zero-pad hidden dim from 768/1280 up to 4096
+                    target_hidden_dim = 4096
+                    pad_size = target_hidden_dim - hidden.shape[-1]
+                    if pad_size > 0:
+                        pad = torch.zeros(
+                            hidden.shape[0], hidden.shape[1], pad_size,
+                            dtype=hidden.dtype, device=hidden.device,
+                        )
+                        hidden = torch.cat([hidden, pad], dim=-1)  # (B, 77, 4096)
+                    clip_hidden_states.append(hidden)
+                else:
+                    # T5 encoder — hidden is already 4096
+                    t5_hidden_states = hidden  # (B, 512, 4096)
+
+        # Concatenate along sequence dimension: (B, 77+77+512, 4096) = (B, 666, 4096)
+        all_hidden = clip_hidden_states
+        if t5_hidden_states is not None:
+            all_hidden = all_hidden + [t5_hidden_states]
+        prompt_embeds = torch.cat(all_hidden, dim=1)
+
+        # Pooled: CLIP-L + CLIP-G concatenated on hidden dim: (B, 768+1280) = (B, 2048)
         pooled_prompt_embeds = torch.cat(pooled_embeds_list, dim=-1)
+
         return prompt_embeds, pooled_prompt_embeds
 
     def _sigmas_for_timesteps(
         self, timesteps: torch.Tensor, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
         scheduler = self.runtime_modules["noise_scheduler"]
-        scheduler_timesteps = scheduler.timesteps.to(device)
-        scheduler_sigmas = scheduler.sigmas.to(device=device, dtype=dtype)
-        step_indices = [(scheduler_timesteps == t).nonzero().item() for t in timesteps]
-        return scheduler_sigmas[step_indices]
+        scheduler_timesteps = scheduler.timesteps.cpu().float()
+        scheduler_sigmas = scheduler.sigmas.cpu().to(dtype=dtype)
+
+        sigmas = []
+        for t in timesteps.cpu():
+            # Use closest match rather than exact to avoid float precision issues
+            idx = (scheduler_timesteps - float(t)).abs().argmin().item()
+            sigmas.append(scheduler_sigmas[idx])
+
+        return torch.stack(sigmas).to(device=device, dtype=dtype)
