@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
+import os
 
 import torch
 import torch.distributed as dist
@@ -34,7 +35,8 @@ class DiffusersSD3Adapter(ModelAdapter):
 
         pipe = StableDiffusion3Pipeline.from_pretrained(
             args.model_name_or_path,
-            torch_dtype=torch.float32,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
         )
         pipe.scheduler.set_timesteps(pipe.scheduler.config.num_train_timesteps)
         self.pipeline = pipe
@@ -61,6 +63,15 @@ class DiffusersSD3Adapter(ModelAdapter):
             self.runtime_modules["text_encoder_2"].requires_grad_(False)
         if self.runtime_modules["text_encoder_3"] is not None:
             self.runtime_modules["text_encoder_3"].requires_grad_(False)
+
+        device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0"))) \
+            if torch.cuda.is_available() else torch.device("cpu")
+        self.runtime_modules["vae"].to(device)
+        self.runtime_modules["text_encoder"].to(device)
+        if self.runtime_modules["text_encoder_2"] is not None:
+            self.runtime_modules["text_encoder_2"].to(device)
+        if self.runtime_modules["text_encoder_3"] is not None:
+            self.runtime_modules["text_encoder_3"].to(device)
 
         return {
             "model": self.primary_train_model,

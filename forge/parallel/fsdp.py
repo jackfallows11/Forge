@@ -42,15 +42,23 @@ class FSDPStrategy(ParallelStrategy):
             raise RuntimeError("torch.distributed must be initialized before FSDPStrategy.prepare_model")
 
         device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
-        model.to(device)
+        # model.to(device)
         mp_policy = self._build_mixed_precision()
+        is_meta = any(p.device.type == "meta" for p in model.parameters())
+
+        def param_init_fn(module: torch.nn.Module) -> None:
+            module.to_empty(device=device)
+            if hasattr(module, "reset_parameters"):
+                module.reset_parameters()
+
         self.model = FSDP(
             model,
             device_id=device,
             use_orig_params=True,
             mixed_precision=mp_policy,
             sharding_strategy=ShardingStrategy.FULL_SHARD,
-            sync_module_states=True,
+            sync_module_states=not is_meta,
+            param_init_fn=param_init_fn if is_meta else None,
         )
         return self.model
 
@@ -121,4 +129,4 @@ class FSDPStrategy(ParallelStrategy):
             dtype = torch.float16
         else:
             dtype = torch.float32
-        return MixedPrecision(param_dtype=torch.float32, reduce_dtype=dtype, buffer_dtype=dtype)
+        return MixedPrecision(param_dtype=dtype, reduce_dtype=dtype, buffer_dtype=dtype)

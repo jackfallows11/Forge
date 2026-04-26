@@ -16,7 +16,7 @@ from forge.training_args import TrainingEngineArgs
 
 
 class SyntheticTextImageDataset(Dataset):
-    def __init__(self, length: int = 16, image_size: int = 1024) -> None:
+    def __init__(self, length: int = 16, image_size: int = 256) -> None:
         self.length = length
         self.image_size = image_size
         self.prompts = [
