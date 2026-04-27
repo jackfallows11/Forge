@@ -33,39 +33,90 @@ class DiffusersSD3Adapter(ModelAdapter):
         if StableDiffusion3Pipeline is None:
             raise RuntimeError("diffusers is unavailable in this environment") from _DIFFUSERS_IMPORT_ERROR
 
-        pipe = StableDiffusion3Pipeline.from_pretrained(
-            args.model_name_or_path,
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
+        import gc
+        from diffusers import (
+            AutoencoderKL,
+            FlowMatchEulerDiscreteScheduler,
+            SD3Transformer2DModel,
         )
-        pipe.scheduler.set_timesteps(pipe.scheduler.config.num_train_timesteps)
-        self.pipeline = pipe
+        from transformers import (
+            CLIPTextModelWithProjection,
+            CLIPTokenizer,
+            T5EncoderModel,
+            T5TokenizerFast,
+        )
+
+        model_path = args.model_name_or_path
+
+        # Load scheduler — tiny, no issue
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            model_path, subfolder="scheduler"
+        )
+        scheduler.set_timesteps(scheduler.config.num_train_timesteps)
+
+        # Load tokenizers — tiny
+        tokenizer   = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer")
+        tokenizer_2 = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer_2")
+        tokenizer_3 = T5TokenizerFast.from_pretrained(model_path, subfolder="tokenizer_3")
+
+        # Load each encoder one at a time, move to CPU, keep in bfloat16
+        # Delete the loader reference immediately so Python can GC the extra copy
+        text_encoder = CLIPTextModelWithProjection.from_pretrained(
+            model_path, subfolder="text_encoder",
+            torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
+        ).to("cpu").eval()
+        text_encoder.requires_grad_(False)
+        gc.collect()
+
+        text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
+            model_path, subfolder="text_encoder_2",
+            torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
+        ).to("cpu").eval()
+        text_encoder_2.requires_grad_(False)
+        gc.collect()
+
+        # text_encoder_3 = T5EncoderModel.from_pretrained(
+        #     model_path, subfolder="text_encoder_3",
+        #     torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
+        # ).to("cpu").eval()
+        # text_encoder_3.requires_grad_(False)
+        # gc.collect()
+        text_encoder_3 = None
+        tokenizer_3 = None
+
+        vae = AutoencoderKL.from_pretrained(
+            model_path, subfolder="vae",
+            torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
+        ).to("cpu").eval()
+        vae.requires_grad_(False)
+        gc.collect()
+
+        # Load the DiT last — it's the largest, but now the others
+        # have already been loaded and GC'd their loader copies
+        dit = SD3Transformer2DModel.from_pretrained(
+            model_path, subfolder="transformer",
+            torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
+        )
+        dit.requires_grad_(True)
+        gc.collect()
 
         self.runtime_modules = {
-            "dit": pipe.transformer,
-            "vae": pipe.vae,
-            "noise_scheduler": pipe.scheduler,
-            "text_encoder": pipe.text_encoder,
-            "text_encoder_2": pipe.text_encoder_2,
-            "text_encoder_3": pipe.text_encoder_3,
-            "tokenizer": pipe.tokenizer,
-            "tokenizer_2": pipe.tokenizer_2,
-            "tokenizer_3": pipe.tokenizer_3,
+            "dit":           dit,
+            "vae":           vae,
+            "noise_scheduler": scheduler,
+            "text_encoder":  text_encoder,
+            "text_encoder_2": text_encoder_2,
+            "text_encoder_3": text_encoder_3,
+            "tokenizer":     tokenizer,
+            "tokenizer_2":   tokenizer_2,
+            "tokenizer_3":   tokenizer_3,
         }
-
         self.trainable_modules = ["dit"]
-        self.primary_train_model = self.runtime_modules["dit"]
+        self.primary_train_model = dit
 
-        # Freeze non-trainable modules and keep on CPU to save GPU memory
-        self.runtime_modules["vae"].requires_grad_(False).to("cpu")
-        self.runtime_modules["text_encoder"].requires_grad_(False).to("cpu")
-        if self.runtime_modules["text_encoder_2"] is not None:
-            self.runtime_modules["text_encoder_2"].requires_grad_(False).to("cpu")
-        if self.runtime_modules["text_encoder_3"] is not None:
-            self.runtime_modules["text_encoder_3"].requires_grad_(False).to("cpu")
-        
-        if hasattr(self.primary_train_model, "enable_gradient_checkpointing"):
-            self.primary_train_model.enable_gradient_checkpointing()
+        # Enable gradient checkpointing to save GPU memory during backward
+        if hasattr(dit, "enable_gradient_checkpointing"):
+            dit.enable_gradient_checkpointing()
 
         return {
             "model": self.primary_train_model,
@@ -96,7 +147,6 @@ class DiffusersSD3Adapter(ModelAdapter):
 
         device = next(model.parameters()).device
         dtype = next(model.parameters()).dtype
-        print(f"DEBUG: model device={device}, dtype={dtype}")
 
         scheduler = self.runtime_modules["noise_scheduler"]
 
